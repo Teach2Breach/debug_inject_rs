@@ -10,7 +10,10 @@ I'll add an 'opsec' branch in the future with additional opsec considerations. I
 
 ## Usage
 
+NOTE - The shellcode takes a little time to execute. It's not instant. This is due to how it is triggered by debug events. 
+
 This project uses litcrypt for string encryption. You must set the 'LITCRYPT_ENCRYPT_KEY' environment variable before running or compiling the project. See the litcrypt documentation for more information: https://crates.io/crates/litcrypt
+
 
 This PoC is designed to be tested with a target remote process by pid provided on the command line. Testing was performed mostly targeting RuntimeBroker.exe. It may not work with all services, but there are many good options. **This tool requires administrative privileges to achieve debugging elevation. This version must be run as admin.**
 

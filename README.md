@@ -22,7 +22,7 @@ cargo run --release <pid>
 
 There are a Lot of print statements in the code. I'm leaving them in for this version for learning purposes. The shellcode is set to pop a calculator. The opsec version will accept shellcode as an argument.
 
-I make no claims to how this will perform against EDR products. Its primary purpose is to be a proof of concept for learning and to have fun ressurecting a cool old project I came across.
+I make no claims to how this will perform against EDR products. Its primary purpose is to be a proof of concept for learning and to have fun resurrecting a cool old project I came across.
 
 I hope you enjoy!
 

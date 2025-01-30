@@ -1,1 +1,0 @@
-implement litcrypt for all strings where possible

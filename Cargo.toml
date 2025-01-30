@@ -2,6 +2,7 @@
 name = "debug_inject_rs"
 version = "0.1.0"
 edition = "2021"
+# author: Teach2Breach
 
 [dependencies]
 noldr = { git = "https://github.com/Teach2Breach/noldr.git", branch = "main" }
